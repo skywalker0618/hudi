@@ -75,6 +75,17 @@ public class TestHoodieSchema {
           + "  ]"
           + "}";
 
+  // The Blob schema is persisted in the table schema of every BLOB table, so its serialized shape is pinned literally.
+  private static final String EXPECTED_BLOB_SCHEMA_JSON = "{\"type\":\"record\",\"name\":\"blob\",\"fields\":["
+      + "{\"name\":\"type\",\"type\":{\"type\":\"enum\",\"name\":\"blob_storage_type\",\"symbols\":[\"INLINE\",\"OUT_OF_LINE\"]}},"
+      + "{\"name\":\"data\",\"type\":[\"null\",\"bytes\"],\"default\":null},"
+      + "{\"name\":\"reference\",\"type\":[\"null\",{\"type\":\"record\",\"name\":\"reference\",\"fields\":["
+      + "{\"name\":\"external_path\",\"type\":\"string\"},"
+      + "{\"name\":\"offset\",\"type\":[\"null\",\"long\"]},"
+      + "{\"name\":\"length\",\"type\":[\"null\",\"long\"]},"
+      + "{\"name\":\"managed\",\"type\":\"boolean\"}]}],\"default\":null}],"
+      + "\"logicalType\":\"blob\"}";
+
   /**
    * Checks if the given Avro schema is a Variant schema. This checks for the Variant logical type.
    *
@@ -380,6 +391,22 @@ public class TestHoodieSchema {
     ), complexNonNullType.getTypes());
 
     assertSame(complexNonNullType, complexNonNullType.getNonNullType());
+
+    // isComplexUnion() is what a walker checks before recursing on getNonNullType()
+    assertTrue(union.isComplexUnion());
+    assertTrue(unionWithoutNull.isComplexUnion());
+    assertTrue(complexUnion.isComplexUnion());
+    assertFalse(HoodieSchema.createNullable(HoodieSchema.create(HoodieSchemaType.STRING)).isComplexUnion());
+    assertFalse(HoodieSchema.createUnion(HoodieSchema.create(HoodieSchemaType.STRING), HoodieSchema.create(HoodieSchemaType.NULL)).isComplexUnion());
+    assertFalse(HoodieSchema.create(HoodieSchemaType.STRING).isComplexUnion());
+
+    // A lone branch has no null to strip and comes back as-is, still a union; null alone has nothing left
+    HoodieSchema loneBranch = HoodieSchema.createUnion(HoodieSchema.create(HoodieSchemaType.STRING));
+    assertSame(loneBranch, loneBranch.getNonNullType());
+    assertTrue(loneBranch.isComplexUnion());
+    HoodieSchema nullOnly = HoodieSchema.createUnion(HoodieSchema.create(HoodieSchemaType.NULL));
+    assertThrows(IllegalArgumentException.class, nullOnly::getNonNullType);
+    assertTrue(nullOnly.isComplexUnion());
   }
 
   @Test
@@ -1490,7 +1517,13 @@ public class TestHoodieSchema {
     // Value field should be nullable for shredded
     assertTrue(fields.get(1).schema().isNullable());
 
-    // Verify typed_value schema
+    // The shredding spec makes typed_value OPTIONAL: a row whose value does not match the
+    // shredding schema (a scalar under an object schema, a JSON null) leaves typed_value null
+    // and carries everything in the value residual. A required typed_value makes such rows
+    // unwritable on the Avro path (parquet-avro: "Null-value for required field: typed_value").
+    assertTrue(fields.get(2).schema().isNullable());
+
+    // Verify typed_value schema: the accessor unwraps the nullable union to the value type.
     HoodieSchema retrievedTypedValueSchema = variantSchema.getTypedValueField().get();
     assertEquals(HoodieSchemaType.RECORD, retrievedTypedValueSchema.getType());
   }
@@ -2479,8 +2512,10 @@ public class TestHoodieSchema {
 
   @Test
   public void testBlobFieldCountMethods() {
-    assertTrue(HoodieSchema.Blob.getFieldCount() > 0);
-    assertTrue(HoodieSchema.Blob.getReferenceFieldCount() > 0);
+    // type, data, reference
+    assertEquals(3, HoodieSchema.Blob.getFieldCount());
+    // external_path, offset, length, managed
+    assertEquals(4, HoodieSchema.Blob.getReferenceFieldCount());
   }
 
   @Test
@@ -2544,6 +2579,10 @@ public class TestHoodieSchema {
     assertTrue(managedOpt.isPresent());
     assertEquals(HoodieSchemaType.BOOLEAN, managedOpt.get().schema().getType());
     assertFalse(managedOpt.get().schema().isNullable());
+
+    // Enum symbols, null-first unions, the null defaults on data/reference (and none on offset/length),
+    // the reference record name and the blob logical type, pinned as the persisted string.
+    assertEquals(EXPECTED_BLOB_SCHEMA_JSON, blob.toAvroSchema().toString());
   }
 
   @Test
@@ -2890,7 +2929,7 @@ public class TestHoodieSchema {
 
   @Test
   public void testCreateShreddedFieldStruct() {
-    HoodieSchema fieldStruct = HoodieSchema.createShreddedFieldStruct("age", HoodieSchema.create(HoodieSchemaType.INT));
+    HoodieSchema fieldStruct = HoodieSchema.createShreddedFieldStruct("age", null, HoodieSchema.create(HoodieSchemaType.INT));
 
     assertNotNull(fieldStruct);
     assertEquals(HoodieSchemaType.RECORD, fieldStruct.getType());
@@ -2913,7 +2952,7 @@ public class TestHoodieSchema {
   @Test
   public void testCreateShreddedFieldStructWithDecimal() {
     HoodieSchema decimalSchema = HoodieSchema.createDecimal(15, 1);
-    HoodieSchema fieldStruct = HoodieSchema.createShreddedFieldStruct("price", decimalSchema);
+    HoodieSchema fieldStruct = HoodieSchema.createShreddedFieldStruct("price", null, decimalSchema);
 
     assertNotNull(fieldStruct);
     List<HoodieSchemaField> fields = fieldStruct.getFields();
@@ -2933,7 +2972,7 @@ public class TestHoodieSchema {
     shreddedFields.put("b", HoodieSchema.create(HoodieSchemaType.STRING));
     shreddedFields.put("c", HoodieSchema.createDecimal(15, 1));
 
-    HoodieSchema.Variant variant = HoodieSchema.createVariantShreddedObject(shreddedFields);
+    HoodieSchema.Variant variant = HoodieSchema.createVariantShreddedObject(null, null, null, shreddedFields);
 
     assertNotNull(variant);
     assertInstanceOf(HoodieSchema.Variant.class, variant);
@@ -3000,6 +3039,11 @@ public class TestHoodieSchema {
     assertEquals("org.apache.hudi", variant.getAvroSchema().getNamespace());
     assertTrue(variant.isShredded());
     assertTrue(TestHoodieSchema.isVariantSchema(variant.getAvroSchema()));
+    // The struct generated per shredded field sits one level below the variant's namespace, under
+    // the typed_value record that holds it, so a field name cannot collide with the two records
+    // generated in that namespace; see createShreddedFieldStruct.
+    assertEquals("org.apache.hudi.typed_value.age",
+        variant.getTypedValueField().get().getField("age").get().schema().getNonNullType().getFullName());
   }
 
   @Test
@@ -3008,7 +3052,7 @@ public class TestHoodieSchema {
     shreddedFields.put("a", HoodieSchema.create(HoodieSchemaType.INT));
     shreddedFields.put("b", HoodieSchema.create(HoodieSchemaType.STRING));
 
-    HoodieSchema.Variant original = HoodieSchema.createVariantShreddedObject(shreddedFields);
+    HoodieSchema.Variant original = HoodieSchema.createVariantShreddedObject(null, null, null, shreddedFields);
     String jsonSchema = original.toString();
 
     // Parse back from JSON
@@ -3043,7 +3087,7 @@ public class TestHoodieSchema {
     shreddedFields.put("b", HoodieSchema.create(HoodieSchemaType.STRING));
     shreddedFields.put("c", HoodieSchema.createDecimal(15, 1));
 
-    HoodieSchema.Variant variant = HoodieSchema.createVariantShreddedObject(shreddedFields);
+    HoodieSchema.Variant variant = HoodieSchema.createVariantShreddedObject(null, null, null, shreddedFields);
 
     // getPlainTypedValueSchema should unwrap the nested {value, typed_value} structs
     Option<HoodieSchema> plainOpt = variant.getPlainTypedValueSchema();
@@ -3094,10 +3138,10 @@ public class TestHoodieSchema {
     // Both record levels are named "typed_value", as the schema converters produce them.
     HoodieSchema innerObject = HoodieSchema.createRecord("typed_value", "inner.ns", null,
         Collections.singletonList(HoodieSchemaField.of("b",
-            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("b_wrapper", HoodieSchema.create(HoodieSchemaType.LONG))))));
+            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("b_wrapper", null, HoodieSchema.create(HoodieSchemaType.LONG))))));
     HoodieSchema topTypedValue = HoodieSchema.createRecord("typed_value", "outer.ns", null,
         Collections.singletonList(HoodieSchemaField.of("a",
-            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("a_wrapper", innerObject)))));
+            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("a_wrapper", null, innerObject)))));
     // Nullable typed_value, as produced by the inferred-shredding splice.
     HoodieSchema.Variant variant = HoodieSchema.createVariantShredded(HoodieSchema.createNullable(topTypedValue));
 
@@ -3129,16 +3173,16 @@ public class TestHoodieSchema {
     // gave both leaves "typed_value_x_y_z_plain").
     HoodieSchema leafObject = HoodieSchema.createRecord("typed_value", "leaf.ns", null,
         Collections.singletonList(HoodieSchemaField.of("c",
-            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("c_wrapper", HoodieSchema.create(HoodieSchemaType.LONG))))));
+            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("c_wrapper", null, HoodieSchema.create(HoodieSchemaType.LONG))))));
     HoodieSchema underXy = HoodieSchema.createRecord("typed_value", "a.ns", null,
         Collections.singletonList(HoodieSchemaField.of("z",
-            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("z_wrapper", leafObject)))));
+            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("z_wrapper", null, leafObject)))));
     HoodieSchema underX = HoodieSchema.createRecord("typed_value", "b.ns", null,
         Collections.singletonList(HoodieSchemaField.of("y_z",
-            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("y_z_wrapper", leafObject)))));
+            HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("y_z_wrapper", null, leafObject)))));
     HoodieSchema topTypedValue = HoodieSchema.createRecord("typed_value", "outer.ns", null, Arrays.asList(
-        HoodieSchemaField.of("x_y", HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("x_y_wrapper", underXy))),
-        HoodieSchemaField.of("x", HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("x_wrapper", underX)))));
+        HoodieSchemaField.of("x_y", HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("x_y_wrapper", null, underXy))),
+        HoodieSchemaField.of("x", HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("x_wrapper", null, underX)))));
 
     HoodieSchema plain = HoodieSchema.createVariantShredded(topTypedValue).getPlainTypedValueSchema().get();
     HoodieSchema zLeaf = nestedRecord(plain, "x_y", "z");
@@ -3166,7 +3210,7 @@ public class TestHoodieSchema {
         Collections.singletonList(
             HoodieSchemaField.of("value", HoodieSchema.createNullable(HoodieSchemaType.BYTES))));
     HoodieSchema topTypedValue = HoodieSchema.createRecord("typed_value", null, null, Arrays.asList(
-        HoodieSchemaField.of("a", HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("a_wrapper", HoodieSchema.create(HoodieSchemaType.INT)))),
+        HoodieSchemaField.of("a", HoodieSchema.createNullable(HoodieSchema.createShreddedFieldStruct("a_wrapper", null, HoodieSchema.create(HoodieSchemaType.INT)))),
         HoodieSchemaField.of("u", HoodieSchema.createNullable(valueOnlyWrapper))));
     HoodieSchema.Variant variant = HoodieSchema.createVariantShredded(topTypedValue);
 
@@ -3184,7 +3228,7 @@ public class TestHoodieSchema {
   public void testGetPlainTypedValueSchemaArrayTypedValue() {
     // Spec form for arrays: typed_value = array<wrapper{value, typed_value: string}>
     HoodieSchema arrayTypedValue = HoodieSchema.createArray(
-        HoodieSchema.createShreddedFieldStruct("element_wrapper", HoodieSchema.create(HoodieSchemaType.STRING)));
+        HoodieSchema.createShreddedFieldStruct("element_wrapper", null, HoodieSchema.create(HoodieSchemaType.STRING)));
     HoodieSchema.Variant variant = HoodieSchema.createVariantShredded(arrayTypedValue);
 
     HoodieSchema plain = variant.getPlainTypedValueSchema().get();

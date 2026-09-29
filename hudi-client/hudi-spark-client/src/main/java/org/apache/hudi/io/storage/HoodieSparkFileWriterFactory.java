@@ -28,9 +28,9 @@ import org.apache.hudi.common.engine.TaskContextSupplier;
 import org.apache.hudi.common.model.MetaFieldsMode;
 import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.ParquetUtils;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.common.util.collection.Pair;
-import org.apache.hudi.core.io.HoodieParquetConfigInjector;
 import org.apache.hudi.core.io.storage.HoodieFileWriter;
 import org.apache.hudi.core.io.storage.HoodieFileWriterFactory;
 import org.apache.hudi.core.io.storage.VariantShreddingInferenceFileWriter;
@@ -101,11 +101,12 @@ public class HoodieSparkFileWriterFactory extends HoodieFileWriterFactory {
       TaskContextSupplier taskContextSupplier) throws IOException {
     MetaFieldsMode metaFieldsMode = MetaFieldsMode.resolve(config);
 
-    Pair<StorageConfiguration, HoodieConfig> injectedConfigs = HoodieParquetConfigInjector.applyConfigInjector(path, storage.getConf(), config);
+    Pair<StorageConfiguration, HoodieConfig> injectedConfigs =
+        ParquetUtils.injectParquetWriterConfigs(path, storage.getConf(), config);
     StorageConfiguration storageConfiguration = injectedConfigs.getLeft();
     HoodieConfig hoodieConfig = injectedConfigs.getRight();
 
-    String compressionCodecName = hoodieConfig.getStringOrDefault(HoodieStorageConfig.PARQUET_COMPRESSION_CODEC_NAME);
+    String compressionCodecName = hoodieConfig.getString(HoodieStorageConfig.PARQUET_COMPRESSION_CODEC_NAME);
     // Support PARQUET_COMPRESSION_CODEC_NAME is ""
     if (compressionCodecName.isEmpty()) {
       compressionCodecName = null;
@@ -130,7 +131,7 @@ public class HoodieSparkFileWriterFactory extends HoodieFileWriterFactory {
                                                   HoodieSchema schema) throws IOException {
     boolean enableBloomFilter = false;
     HoodieRowParquetWriteSupport writeSupport = getHoodieRowParquetWriteSupport(storage.getConf(), schema, config, enableBloomFilter);
-    String compressionCodecName = config.getStringOrDefault(HoodieStorageConfig.PARQUET_COMPRESSION_CODEC_NAME);
+    String compressionCodecName = config.getString(HoodieStorageConfig.PARQUET_COMPRESSION_CODEC_NAME);
     // Support PARQUET_COMPRESSION_CODEC_NAME is ""
     if (compressionCodecName.isEmpty()) {
       compressionCodecName = null;

@@ -29,6 +29,7 @@ import org.apache.hudi.common.schema.HoodieSchemaRepair
 import org.apache.hudi.common.schema.HoodieSchemaUtils
 import org.apache.hudi.common.schema.internal.InternalSchema
 import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient, ParquetTableSchemaResolver}
+import org.apache.hudi.common.table.log.InstantRange
 import org.apache.hudi.common.table.read.{HoodieFileGroupReader, HoodieRecordReader}
 import org.apache.hudi.common.table.read.lsm.{HoodieLsmFileGroupReader, LsmReaderUtils}
 import org.apache.hudi.common.util.{ConfigUtils, Option => HOption}
@@ -51,13 +52,13 @@ import org.apache.spark.sql.HoodieCatalystExpressionUtils.generateUnsafeProjecti
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{JoinedRow, UnsafeProjection}
-import org.apache.spark.sql.execution.datasources.{OutputWriterFactory, PartitionedFile, SparkColumnarFileReader}
+import org.apache.spark.sql.execution.datasources.{OutputWriterFactory, PartitionedFile, SparkColumnarFileReader, SparkSchemaTransformUtils}
 import org.apache.spark.sql.execution.datasources.orc.OrcUtils
 import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, OnHeapColumnVector}
 import org.apache.spark.sql.hudi.MultipleColumnarFileFormatReader
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.Filter
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnarBatchUtils}
 import org.apache.spark.util.SerializableConfiguration
 
@@ -75,6 +76,10 @@ trait HoodieFormatTrait {
 /**
  * This class utilizes {@link HoodieFileGroupReader} and its related classes to support reading
  * from Parquet or ORC formatted base files and their log files.
+ *
+ * @param instantRangeOpt optional requested-time range applied before file-group record merging;
+ *                        unlike Spark's required filters, this prevents a later out-of-range log
+ *                        record from masking an earlier in-range version of the same key
  */
 class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
                                            tableSchema: HoodieTableSchema,
@@ -88,7 +93,8 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
                                            shouldUseRecordPosition: Boolean,
                                            requiredFilters: Seq[Filter],
                                            isMultipleBaseFileFormatsEnabled: Boolean,
-                                           hoodieFileFormat: HoodieFileFormat)
+                                           hoodieFileFormat: HoodieFileFormat,
+                                           instantRangeOpt: HOption[InstantRange] = HOption.empty())
   extends ParquetFileFormat with SparkAdapterSupport with HoodieFormatTrait with Logging with Serializable {
 
   private lazy val schema = tableSchema.schema
@@ -136,6 +142,25 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
   }
 
   /**
+   * True when `dataType` itself, or anything it nests, satisfies `predicate`. A struct that
+   * matches is reported without descending into it, so a variant projection struct is answered
+   * as one type rather than as its pushed-down extraction fields.
+   */
+  private def containsType(dataType: DataType, predicate: DataType => Boolean): Boolean = {
+    predicate(dataType) || (dataType match {
+      case s: StructType => s.fields.exists(f => containsType(f.dataType, predicate))
+      case a: ArrayType => containsType(a.elementType, predicate)
+      case m: MapType => containsType(m.valueType, predicate)
+      case _ => false
+    })
+  }
+
+  private def isVariantProjection(dataType: DataType): Boolean = dataType match {
+    case s: StructType => sparkAdapter.isVariantProjectionStruct(s)
+    case _ => false
+  }
+
+  /**
    * Checks if the file format supports vectorized reading, please refer to SPARK-40918.
    *
    * NOTE: for mor read, even for file-slice with only base file, we can read parquet file with vectorized read,
@@ -153,8 +178,7 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
       supportVectorizedRead = false
       supportReturningBatch = false
       false
-    } else if (schema.fields.exists(f => f.dataType.isInstanceOf[StructType]
-        && sparkAdapter.isVariantProjectionStruct(f.dataType.asInstanceOf[StructType]))) {
+    } else if (schema.fields.exists(f => containsType(f.dataType, isVariantProjection))) {
       // Spark 4.1's PushVariantIntoScan rewrites a variant column to a struct of pushed-down
       // extractions. The Spark vectorized parquet reader treats this as a nested type change
       // (data column is VariantType, required is a struct) and refuses to read in vectorized
@@ -162,9 +186,21 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
       supportVectorizedRead = false
       supportReturningBatch = false
       false
-    } else if (HoodieSparkUtils.gteqSpark4_1 && schema.fields.exists(f => sparkAdapter.isVariantType(f.dataType))) {
+    } else if (HoodieSparkUtils.gteqSpark4_1
+        && schema.fields.exists(f => containsType(f.dataType, sparkAdapter.isVariantType))) {
       // #18605: Spark 4.1's vectorized variant read produces UnsafeRow encodings that SIGBUS
       // during RangePartitioner sampling. Force row-based reads. Spark 4.0 unaffected.
+      //
+      // Both checks above walk the schema instead of scanning top-level fields only. Spark's
+      // ParquetUtils.isBatchReadSupported treats VariantType as an atomic type and, once
+      // spark.sql.parquet.enableNestedColumnVectorizedReader is on - on by default since Spark
+      // 3.4.0 (added in 3.3.0, off) - nested columns as batch-readable, so at stock settings a
+      // variant reached the vectorized reader whenever it sat inside a struct/array/map even
+      // though a top-level one did not. The SIGBUS is in the UnsafeRow encoding of the vectorized
+      // variant vectors that RangePartitioner samples, and it samples WHOLE rows, so a variant
+      // carried inside a struct is exposed exactly the same way under any range-partitioned query.
+      // The cost is that nested-variant tables lose vectorization on 4.1+ by default, exactly as
+      // top-level ones do.
       supportVectorizedRead = false
       supportReturningBatch = false
       false
@@ -255,8 +291,21 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
                                               filters: Seq[Filter],
                                               options: Map[String, String],
                                               hadoopConf: Configuration): PartitionedFile => Iterator[InternalRow] = {
+    // Driver side, once per scan: Spark 4.0 cannot read a PushVariantIntoScan projection struct and
+    // has to fail here rather than in the schema-change path (#20032).
+    sparkAdapter.validateVariantProjectionReadable(requiredSchema)
     val outputSchema = StructType(requiredSchema.fields ++ partitionSchema.fields)
     val isCount = requiredSchema.isEmpty && !isMOR && !isIncremental
+    // Spark planner only adds the user-provided predicates (from `WHERE` clause or `.filter()`)
+    // to `filters`; the `requiredFilters` from `HoodieBaseHadoopFsRelationFactory#getRequiredFilters`
+    // are not visible to the planner, thus the `requiredSchema` passed by Spark can miss the
+    // columns in `requiredFilters`.  This happens for incremental query where `requiredFilters`
+    // is present.  To allow correct projection and filtering, the columns from `requiredFilters`
+    // are added back to the `readRequiredSchema` for reading the file.
+    val filterOnlyFields = requiredFilters.flatMap(_.references).distinct
+      .filterNot(name => requiredSchema.fieldNames.contains(name) || partitionSchema.fieldNames.contains(name))
+      .flatMap(name => dataStructType.fields.find(_.name == name))
+    val readRequiredSchema = StructType(requiredSchema.fields ++ filterOnlyFields)
     val augmentedStorageConf = new HadoopStorageConfiguration(hadoopConf).getInline
     setSchemaEvolutionConfigs(augmentedStorageConf)
     augmentedStorageConf.set(ENABLE_LOGICAL_TIMESTAMP_REPAIR, hasTimestampMillisFieldInTableSchema.toString)
@@ -276,8 +325,22 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
     val exclusionFields = new java.util.HashSet[String]()
     exclusionFields.add("op")
     partitionSchema.fields.foreach(f => exclusionFields.add(f.name))
-    val requestedStructType = StructType(requiredSchema.fields ++ partitionSchema.fields.filter(f => mandatoryFields.contains(f.name) && !isNestedPartitionField(f.name)))
+    val requestedStructType = StructType(readRequiredSchema.fields ++ partitionSchema.fields.filter(f => mandatoryFields.contains(f.name) && !isNestedPartitionField(f.name)))
     val requestedSchema = HoodieSchemaUtils.pruneDataSchema(schema, HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(requestedStructType, sanitizedTableName), exclusionFields)
+    // The reader emits requestedSchema -- FileGroupReaderSchemaHandler projects its merged rows back
+    // down to it -- and that is wider than requestedStructType wherever pruneDataSchema had to keep a
+    // column whole: a union (a member0..memberN struct on the Spark side), a BLOB or a VARIANT that
+    // Spark's nested schema pruning asked only some inner fields of. Bind the output projection to the
+    // emitted shape rather than to what was asked for, so it resolves by name and drops the rest; a
+    // field the reader does not widen keeps the requested type, which is what it already had.
+    val readerStructType = HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(requestedSchema)
+    val requestedFieldsByName = requestedStructType.fields.map(f => f.name -> f).toMap
+    val projectionInputSchema = StructType(readerStructType.fields.map { readerField =>
+      requestedFieldsByName.get(readerField.name) match {
+        case Some(f) if !SparkSchemaTransformUtils.needsNestedPruning(readerField.dataType, f.dataType) => f
+        case _ => readerField
+      }
+    })
     val dataStructTypeWithMandatoryPartitionFields = StructType(dataStructType.fields ++ partitionSchema.fields.filter(f => mandatoryFields.contains(f.name) && !isNestedPartitionField(f.name)))
     val dataSchema = HoodieSchemaUtils.pruneDataSchema(schema, HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(dataStructTypeWithMandatoryPartitionFields, sanitizedTableName), exclusionFields)
 
@@ -312,9 +375,11 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
             .getSparkPartitionedFileUtils.getPathFromPartitionedFile(file))
           fileSliceMapping.getSlice(fileGroupName) match {
             case Some(fileSlice) if !isCount && (requiredSchema.nonEmpty || fileSlice.getLogFiles.findAny().isPresent) =>
+              // requiredFilters preserve Spark's row-level filtering semantics, while instantRangeOpt
+              // keeps out-of-range records from participating in the file-group merge itself.
               val readerContext = new SparkFileFormatInternalRowReaderContext(
                 fileGroupBaseFileReader.value, filters, requiredFilters, storageConf, metaClient.getTableConfig,
-                sparkRequiredSchema = Some(requiredSchema))
+                sparkRequiredSchema = Some(requiredSchema), instantRangeOpt = instantRangeOpt)
               readerContext.enableLogicalTimestampFieldRepair(storageConf.getBoolean(ENABLE_LOGICAL_TIMESTAMP_REPAIR, true))
               val props = metaClient.getTableConfig.getProps
               options.foreach(kv => props.setProperty(kv._1, kv._2))
@@ -362,7 +427,7 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
               // Append partition values to rows and project to output schema
               appendPartitionAndProject(
                 reader.getClosableIterator,
-                requestedStructType,
+                projectionInputSchema,
                 remainingPartitionSchema,
                 outputSchema,
                 fileSliceMapping.getPartitionValues,
@@ -370,7 +435,7 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
 
             case _ =>
               readBaseFile(file, baseFileReader.value, requestedStructType, remainingPartitionSchema, fixedPartitionIndexes,
-                requiredSchema, partitionSchema, outputSchema, filters ++ requiredFilters, storageConf)
+                readRequiredSchema, partitionSchema, outputSchema, filters ++ requiredFilters, storageConf)
           }
         // CDC queries.
         case hoodiePartitionCDCFileGroupSliceMapping: HoodiePartitionCDCFileGroupMapping =>
@@ -378,7 +443,7 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
 
         case _ =>
           readBaseFile(file, baseFileReader.value, requestedStructType, remainingPartitionSchema, fixedPartitionIndexes,
-            requiredSchema, partitionSchema, outputSchema, filters ++ requiredFilters, storageConf)
+            readRequiredSchema, partitionSchema, outputSchema, filters ++ requiredFilters, storageConf)
       }
       CloseableIteratorListener.addListener(iter)
     }
@@ -453,7 +518,7 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
         //some partition fields read from file, some were not
         getFixedPartitionValues(partitionValues, partitionSchema, fixedPartitionIndexes)
       }
-      val unsafeProjection = generateUnsafeProjection(StructType(inputSchema.fields ++ partitionSchema.fields), to)
+      val unsafeProjection = generateOutputProjection(StructType(inputSchema.fields ++ partitionSchema.fields), to)
       val joinedRow = new JoinedRow()
       makeCloseableFileGroupMappingRecordIterator(iter, d => unsafeProjection(joinedRow(d, fixedPartitionValues)))
     }
@@ -462,8 +527,24 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
   private def projectSchema(iter: ClosableIterator[InternalRow],
                             from: StructType,
                             to: StructType): Iterator[InternalRow] = {
-    val unsafeProjection = generateUnsafeProjection(from, to)
+    val unsafeProjection = generateOutputProjection(from, to)
     makeCloseableFileGroupMappingRecordIterator(iter, d => unsafeProjection(d))
+  }
+
+  /**
+   * The scan's output projection. Stays the by-name top-level projection unless a column comes out of the
+   * reader with nested fields Spark did not ask for (see `projectionInputSchema` in
+   * buildReaderWithPartitionValues), in which case those are dropped by name at every depth.
+   */
+  private def generateOutputProjection(from: StructType, to: StructType): UnsafeProjection = {
+    val hasWiderNestedInput = to.fields.exists { f =>
+      from.getFieldIndex(f.name).exists(i => SparkSchemaTransformUtils.needsNestedPruning(from.fields(i).dataType, f.dataType))
+    }
+    if (hasWiderNestedInput) {
+      SparkSchemaTransformUtils.generateNestedPruningProjection(from, to)
+    } else {
+      generateUnsafeProjection(from, to)
+    }
   }
 
   private def makeCloseableFileGroupMappingRecordIterator(closeableFileGroupRecordIterator: ClosableIterator[InternalRow],
@@ -527,28 +608,31 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
 
   // executor
   private def readBaseFile(file: PartitionedFile, parquetFileReader: SparkColumnarFileReader, requestedSchema: StructType,
-                           remainingPartitionSchema: StructType, fixedPartitionIndexes: Set[Int], requiredSchema: StructType,
+                           remainingPartitionSchema: StructType, fixedPartitionIndexes: Set[Int], readRequiredSchema: StructType,
                            partitionSchema: StructType, outputSchema: StructType, filters: Seq[Filter],
                            storageConf: StorageConfiguration[Configuration]): Iterator[InternalRow] = {
     // Detect vector columns and create modified schemas with BinaryType.
     // Each schema is detected independently because ordinals are relative to the schema being
     // modified — outputSchema and requestedSchema may have vector columns at different positions
-    // than requiredSchema (e.g. when partition columns are interleaved).
-    val (modifiedRequiredSchema, vectorCols) = withVectorRewrite(requiredSchema)
+    // than readRequiredSchema (e.g. when partition columns are interleaved).
+    val (modifiedReadRequiredSchema, vectorCols) = withVectorRewrite(readRequiredSchema)
     val hasVectors = vectorCols.nonEmpty
     val (modifiedOutputSchema, outputVectorCols) = if (hasVectors) withVectorRewrite(outputSchema) else (outputSchema, Map.empty[Int, HoodieSchema.Vector])
     val (modifiedRequestedSchema, _) = if (hasVectors) withVectorRewrite(requestedSchema) else (requestedSchema, Map.empty[Int, HoodieSchema.Vector])
 
     val rawIter = if (remainingPartitionSchema.fields.length == partitionSchema.fields.length) {
       //none of partition fields are read from the file, so the reader will do the appending for us
-      parquetFileReader.read(file, modifiedRequiredSchema, partitionSchema, internalSchemaOpt, filters, storageConf, tableSchemaAsMessageType)
+      val iter = parquetFileReader.read(file, modifiedReadRequiredSchema, partitionSchema, internalSchemaOpt, filters, storageConf, tableSchemaAsMessageType)
+      projectIfNeeded(iter, StructType(modifiedReadRequiredSchema.fields ++ partitionSchema.fields), modifiedOutputSchema)
     } else if (remainingPartitionSchema.fields.length == 0) {
       //we read all of the partition fields from the file
       val pfileUtils = sparkAdapter.getSparkPartitionedFileUtils
       //we need to modify the partitioned file so that the partition values are empty
       val modifiedFile = pfileUtils.createPartitionedFile(InternalRow.empty, pfileUtils.getPathFromPartitionedFile(file), file.start, file.length)
+      val readSchema = StructType(modifiedReadRequiredSchema.fields ++ partitionSchema.fields)
       //and we pass an empty schema for the partition schema
-      parquetFileReader.read(modifiedFile, modifiedOutputSchema, new StructType(), internalSchemaOpt, filters, storageConf, tableSchemaAsMessageType)
+      val iter = parquetFileReader.read(modifiedFile, readSchema, new StructType(), internalSchemaOpt, filters, storageConf, tableSchemaAsMessageType)
+      projectIfNeeded(iter, readSchema, modifiedOutputSchema)
     } else {
       //need to do an additional projection here. The case in mind is that partition schema is "a,b,c" mandatoryFields is "a,c",
       //then we will read (dataSchema + a + c) and append b. So the final schema will be (data schema + a + c +b)
@@ -561,13 +645,10 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
     }
 
     if (hasVectors) {
-      // The raw iterator has BinaryType for vector columns; convert back to ArrayType
-      val readSchema = if (remainingPartitionSchema.fields.length == partitionSchema.fields.length) {
-        StructType(modifiedRequiredSchema.fields ++ partitionSchema.fields)
-      } else {
-        modifiedOutputSchema
-      }
-      wrapWithVectorConversion(rawIter, readSchema, outputSchema, outputVectorCols)
+      // The raw iterator has BinaryType for vector columns; convert back to ArrayType.
+      // All branches above produce rows in modifiedOutputSchema: filter-only columns from
+      // readRequiredSchema are projected away by projectIfNeeded/projectIter.
+      wrapWithVectorConversion(rawIter, modifiedOutputSchema, outputSchema, outputVectorCols)
     } else {
       rawIter
     }
@@ -589,6 +670,18 @@ class HoodieFileGroupReaderBasedFileFormat(tablePath: String,
    * fields are treated as appended partition fields rather than read from the file.
    */
   private def isNestedPartitionField(name: String): Boolean = name.contains(".")
+
+  /**
+   * Projects to `to` only when the read schema was augmented with filter-only columns;
+   * otherwise returns the iterator as is, preserving columnar batches.
+   */
+  private def projectIfNeeded(iter: Iterator[InternalRow], from: StructType, to: StructType): Iterator[InternalRow] = {
+    if (from.fieldNames.sameElements(to.fieldNames)) {
+      iter
+    } else {
+      projectIter(iter, from, to)
+    }
+  }
 
   private def getFixedPartitionValues(allPartitionValues: InternalRow, partitionSchema: StructType, fixedPartitionIndexes: Set[Int]): InternalRow = {
     InternalRow.fromSeq(allPartitionValues.toSeq(partitionSchema).zipWithIndex.filter(p => fixedPartitionIndexes.contains(p._2)).map(p => p._1))
